@@ -67,7 +67,7 @@ const FOLLOWER int = 0
 const LEADER int = 1
 const CANDIDATE int = 2
 
-const HEARTBEAT_FREQUNCY time.Duration = 400 * time.Millisecond
+const HEARTBEAT_FREQUNCY time.Duration = 100 * time.Millisecond
 const ELECTION_TIMEOUT_LOWER = 300
 const ELECTION_TIMEOUT_UPPER = 600
 
@@ -245,9 +245,7 @@ func (rf *Raft) Elect() {
 	// The server has not received communication from leaders/candidates for a while,
 	// in this case it should become a candidate itself and request votes from others
 	var mutex sync.Mutex
-
 	var votesLock sync.Mutex
-
 	condvar := sync.NewCond(&mutex)
 
 
@@ -339,6 +337,17 @@ func (rf *Raft) Elect() {
 		if rf.serverRole == CANDIDATE && votesCount > len(rf.peers) / 2 {
 			rf.serverRole = LEADER
 			DPrintf("s%d elected as leader with %d votes, term:%d\n", rf.me, votesCount, rf.currentTerm)
+
+			// Initialize nextIndex and matchIndex
+			for i, _ := range rf.nextIndex {
+				rf.nextIndex[i] = len(rf.logs)
+			}
+
+			for i, _ := range rf.matchIndex {
+				rf.matchIndex[i] = 0
+			}
+
+
 		} else {
 			DPrintf("s%d not elected,votes:%d, term:%d\n", rf.me, votesCount, rf.currentTerm)
 			rf.serverRole = FOLLOWER
@@ -448,20 +457,63 @@ func (rf *Raft) sendSingleHeartbeat(index int) {
 
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-
-	rf.sendAppendEntries(index, &AppendEntriesArgs{
-		LogEntries:[]Log{},
-		Term:currentTerm,
-	}, &appendEntriesReply)
-
-	rf.mu.Lock()
-	if appendEntriesReply.Term > rf.currentTerm {
-		rf.currentTerm = appendEntriesReply.Term
-		rf.serverRole = FOLLOWER
-		rf.votedFor = -1
+	leaderCommitIndex := rf.commitIndex
+	prevLogIndex := rf.nextIndex[index] - 1
+	prevLogTerm := -1
+	if prevLogIndex >= 0 {
+		prevLogTerm = rf.logs[prevLogIndex].Term
 	}
+	leaderID := rf.me
 	rf.mu.Unlock()
+
+
+	appendEntriesArgs := AppendEntriesArgs{
+		Term:currentTerm,
+		LeaderID:leaderID,
+		PrevLogIndex:prevLogIndex,
+		PrevLogTerm:prevLogTerm,
+		LogEntries:[]Log{},
+		LeaderCommitIndex:leaderCommitIndex,
+	}
+
+	ok := rf.sendAppendEntries(index, &appendEntriesArgs, &appendEntriesReply)
+	for !ok {
+		ok = rf.sendAppendEntries(index, &appendEntriesArgs, &appendEntriesReply)
+		if !ok {
+			// Request not sent for some reason
+			continue
+		}
+		rf.mu.Lock()
+		if !appendEntriesReply.Success {
+			if appendEntriesReply.Term > rf.currentTerm {
+				rf.currentTerm = appendEntriesReply.Term
+				rf.serverRole = FOLLOWER
+				rf.votedFor = -1
+				rf.mu.Unlock()
+				break
+			} else {
+				// PrevLogIndex does not match, decrement nextIndex and retry
+				rf.nextIndex[index] -= 1
+				prevLogIndex := rf.nextIndex[index] - 1
+				prevLogTerm := -1
+				if prevLogIndex >= 0 {
+					prevLogTerm = rf.logs[prevLogIndex].Term
+				}
+				appendEntriesArgs.PrevLogIndex = prevLogIndex
+				appendEntriesArgs.PrevLogTerm = prevLogTerm
+				appendEntriesArgs.LogEntries = rf.logs[rf.nextIndex[index]:]
+
+				ok = false
+				rf.mu.Unlock()
+				continue
+			}
+		} else {
+			// Logs are consistent now, update next index
+			rf.nextIndex[index] = len(rf.logs)
+			rf.mu.Unlock()
+			break
+		}
+	}
 }
 
 func (rf *Raft) startHeartbeats() {
@@ -495,11 +547,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	rf.resetElectionTimer()
 
+	reply.Term = rf.currentTerm
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
-		reply.Term = rf.currentTerm
-
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
@@ -511,11 +562,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	//  If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it
-	if rf.logs[args.PrevLogIndex].Term != args.Term {
-		rf.logs = rf.logs[:args.PrevLogIndex]
+	// but different terms), delete the existing entry and all that follow it
+	if args.PrevLogIndex != -1 {
+		if rf.logs[args.PrevLogIndex].Term != args.Term {
+			rf.logs = rf.logs[:args.PrevLogIndex]
+			reply.Success = false
+			rf.mu.Unlock()
+			return
+		}
 	}
+
 
 	// Append any new entries not already in the log
 	for _, log := range args.LogEntries {
@@ -555,29 +611,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendSingleAppendEntries(server int, command Log) bool {
-	var appendEntriesArg AppendEntriesArgs
-	var appendEntriesReply AppendEntriesReply
-
-	// Construct appendEntriesArg here
-	appendEntriesArg.Term = rf.currentTerm
-	appendEntriesArg.LeaderID = rf.me
-
-	ok := rf.sendAppendEntries(server, &appendEntriesArg, &appendEntriesReply)
-	for !ok {
-		ok = rf.sendAppendEntries(server, &appendEntriesArg, &appendEntriesReply)
-	}
-
-	// Handle reply here
-	if appendEntriesReply.Term > rf.currentTerm {
-		rf.serverRole = FOLLOWER
-		rf.currentTerm = appendEntriesArg.Term
-		rf.votedFor = -1
-	}
-
-	return appendEntriesReply.Success
-}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -593,6 +626,8 @@ func (rf *Raft) sendSingleAppendEntries(server int, command Log) bool {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// I think we should assume that Start won't be called before last command has been committed
+	// Otherwise
 	index := -1
 	term := -1
 	isLeader := true
@@ -607,17 +642,137 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	rf.logs = append(rf.logs, command.(Log))
 
+	rf.logs = append(rf.logs, command.(Log))
+	lastLogIndex := len(rf.logs) - 1
 	rf.mu.Unlock()
 
-	for i, _ := range rf.peers {
-		// No need to send AppendEntries to leader itself
-		if i == rf.me {
-			continue
+	replicates := 1
+	finished := false
+	var mutex sync.Mutex
+	var replicatesLock sync.Mutex
+	condvar := sync.NewCond(&mutex)
+
+	go func(command Log, lastLogIndex int) {
+		for i, _ := range rf.peers {
+			// No need to send AppendEntries to leader itself
+			rf.mu.Lock()
+			if i == rf.me {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+
+			go func(index int) {
+				var appendEntriesArg AppendEntriesArgs
+				var appendEntriesReply AppendEntriesReply
+
+				// Construct appendEntriesArg here
+				rf.mu.Lock()
+
+				prevLogIndex := rf.nextIndex[index] - 1
+				prevLogTerm := -1
+				if prevLogIndex >= 0 {
+					prevLogTerm = rf.logs[prevLogIndex].Term
+				}
+
+				appendEntriesArg.Term = rf.currentTerm
+				appendEntriesArg.LeaderID = rf.me
+				appendEntriesArg.PrevLogIndex = prevLogIndex
+				appendEntriesArg.PrevLogTerm = prevLogTerm
+				appendEntriesArg.LogEntries = rf.logs[rf.nextIndex[index]:]
+				appendEntriesArg.LeaderCommitIndex = rf.commitIndex
+
+				rf.mu.Unlock()
+				isConsistent := false
+				ok := rf.sendAppendEntries(index, &appendEntriesArg, &appendEntriesReply)
+				for !ok {
+					ok = rf.sendAppendEntries(index, &appendEntriesArg, &appendEntriesReply)
+					if !ok {
+						// Request not sent for some reason
+						continue
+					}
+					// Handle reply here
+					rf.mu.Lock()
+					if !appendEntriesReply.Success {
+						if appendEntriesReply.Term > rf.currentTerm {
+							rf.serverRole = FOLLOWER
+							rf.currentTerm = appendEntriesArg.Term
+							rf.votedFor = -1
+							rf.mu.Unlock()
+							break
+						} else {
+							// PrevLogIndex does not match, decrement nextIndex and retry
+							rf.nextIndex[index] -= 1
+							prevLogIndex := rf.nextIndex[index] - 1
+							prevLogTerm := -1
+							if prevLogIndex >= 0 {
+								prevLogTerm = rf.logs[prevLogIndex].Term
+							}
+							appendEntriesArg.PrevLogIndex = prevLogIndex
+							appendEntriesArg.PrevLogTerm = prevLogTerm
+							appendEntriesArg.LogEntries = rf.logs[rf.nextIndex[index]:]
+
+							ok = false
+							rf.mu.Unlock()
+							continue
+						}
+					} else {
+						// Logs are consistent now
+						rf.nextIndex[index] = len(rf.logs)
+						isConsistent = true
+						break
+						rf.mu.Unlock()
+					}
+				}
+
+				if isConsistent {
+					replicatesLock.Lock()
+					replicates += 1
+					if replicates > len(rf.peers) / 2 {
+						condvar.Signal()
+					}
+					replicatesLock.Unlock()
+				}
+
+			}(i)
 		}
-		go rf.sendSingleAppendEntries(i, command.(Log))
-	}
+
+		// Check if log is replicated to majority in here
+		// Wait until all votes are collected
+		time.AfterFunc(1000 * time.Millisecond, func() {
+			replicatesLock.Lock()
+			finished = true
+			replicatesLock.Unlock()
+			condvar.Signal()
+		})
+
+		condvar.L.Lock()
+		for {
+			rf.mu.Lock()
+			numPeers := len(rf.peers)
+			rf.mu.Unlock()
+
+			replicatesLock.Lock()
+			replicatesClone := replicates
+
+			if replicatesClone > numPeers / 2 || finished {
+				replicatesLock.Unlock()
+				break
+			}
+			replicatesLock.Unlock()
+			condvar.Wait()
+		}
+		condvar.L.Unlock()
+
+		// Either the log is replicated to majority or we timed out
+		rf.mu.Lock()
+		if replicates > len(rf.peers) / 2 {
+			rf.commitIndex = lastLogIndex
+		}
+		rf.mu.Unlock()
+
+	}(command.(Log), lastLogIndex)
 
 	return index, term, isLeader
 }
